@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/obot-platform/nanobot/pkg/complete"
 	"github.com/obot-platform/nanobot/pkg/envvar"
 	"github.com/obot-platform/nanobot/pkg/expr"
@@ -904,31 +906,60 @@ func (s *Service) ListTools(ctx context.Context, opts ...ListToolsOptions) (resu
 		opt.Servers = append(serverList, agentsList...)
 	}
 
-	for _, server := range opt.Servers {
+	// Fetch each server's tools concurrently instead of one at a time: GetClient
+	// pays for a full session init (token exchange + SSE connect) on first use,
+	// so a sequential loop here means N servers pay that cost back-to-back.
+	// Capped concurrency avoids hammering the token-exchange endpoint or the
+	// underlying MCP servers with an unbounded burst of simultaneous connects.
+	limit := s.concurrency
+	if limit <= 0 {
+		limit = 8
+	}
+
+	results := make([]ListToolsResult, len(opt.Servers))
+	present := make([]bool, len(opt.Servers))
+
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.SetLimit(limit)
+
+	for i, server := range opt.Servers {
 		if !slices.Contains(serverList, server) {
 			continue
 		}
 
-		c, err := s.GetClient(ctx, server)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get client for %s: %w", server, err)
-		}
+		eg.Go(func() error {
+			c, err := s.GetClient(egCtx, server)
+			if err != nil {
+				return fmt.Errorf("failed to get client for %s: %w", server, err)
+			}
 
-		tools, err := c.ListTools(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list tools for %s: %w", server, err)
-		}
+			tools, err := c.ListTools(egCtx)
+			if err != nil {
+				return fmt.Errorf("failed to list tools for %s: %w", server, err)
+			}
 
-		tools = filterTools(tools, opt.Tools)
+			tools = filterTools(tools, opt.Tools)
+			if len(tools.Tools) == 0 {
+				return nil
+			}
 
-		if len(tools.Tools) == 0 {
-			continue
-		}
-
-		result = append(result, ListToolsResult{
-			Server: server,
-			Tools:  tools.Tools,
+			results[i] = ListToolsResult{
+				Server: server,
+				Tools:  tools.Tools,
+			}
+			present[i] = true
+			return nil
 		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	for i, ok := range present {
+		if ok {
+			result = append(result, results[i])
+		}
 	}
 
 	for _, agentName := range opt.Servers {
